@@ -1,0 +1,167 @@
+for POLICY in \
+  "arn:aws:iam::aws:policy/AmazonEKSComputePolicy" \
+  "arn:aws:iam::aws:policy/AmazonEKSBlockStoragePolicy" \
+  "arn:aws:iam::aws:policy/AmazonEKSLoadBalancingPolicy" \
+  "arn:aws:iam::aws:policy/AmazonEKSNetworkingPolicy" \
+  "arn:aws:iam::aws:policy/AmazonEKSClusterPolicy"
+do
+  echo "Attaching policy ${POLICY} to IAM role ${DEMO_CLUSTER_ROLE_NAME}..."
+  aws iam attach-role-policy --role-name ${DEMO_CLUSTER_ROLE_NAME} --policy-arn ${POLICY}
+done
+
+aws iam update-assume-role-policy --role-name $DEMO_CLUSTER_ROLE_NAME --policy-document '{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "eks.amazonaws.com"
+      },
+      "Action": [
+        "sts:AssumeRole",
+        "sts:TagSession"
+      ]
+    }
+  ]
+}'
+
+
+aws iam get-role --role-name ${DEMO_CLUSTER_ROLE_NAME} | \
+  jq -r '.Role.AssumeRolePolicyDocument.Statement[].Action[]'
+
+aws iam list-attached-role-policies --role-name ${DEMO_CLUSTER_ROLE_NAME} | \
+  jq -r '.AttachedPolicies[].PolicyName'
+
+
+aws eks update-cluster-config \
+    --name ${DEMO_CLUSTER_NAME} \
+    --compute-config enabled=true,nodeRoleArn=${DEMO_CLUSTER_NODE_ROLE_ARN},nodePools=system,general-purpose \
+    --kubernetes-network-config '{"elasticLoadBalancing":{"enabled": true}}' \
+    --storage-config '{"blockStorage":{"enabled": true}}'
+aws eks describe-cluster --name ${DEMO_CLUSTER_NAME} --query 'cluster.status'
+
+aws eks describe-cluster --name ${DEMO_CLUSTER_NAME} --query 'cluster.status'
+
+kubectl get crd | grep eks.amazonaws.com
+
+
+cat << EOF > ~/environment/values-ui.yaml
+
+app:
+  theme: default
+  endpoints:
+    catalog: http://retail-store-app-catalog:80
+    carts: http://retail-store-app-carts:80
+    checkout: http://retail-store-app-checkout:80
+    orders: http://retail-store-app-orders:80
+EOF
+
+helm upgrade -i retail-store-app-catalog oci://public.ecr.aws/aws-containers/retail-store-sample-catalog-chart --version ${RETAIL_STORE_APP_HELM_CHART_VERSION} --hide-notes
+helm upgrade -i retail-store-app-orders oci://public.ecr.aws/aws-containers/retail-store-sample-orders-chart --version ${RETAIL_STORE_APP_HELM_CHART_VERSION} --hide-notes
+helm upgrade -i retail-store-app-carts oci://public.ecr.aws/aws-containers/retail-store-sample-cart-chart --version ${RETAIL_STORE_APP_HELM_CHART_VERSION} --hide-notes
+helm upgrade -i retail-store-app-checkout oci://public.ecr.aws/aws-containers/retail-store-sample-checkout-chart --version ${RETAIL_STORE_APP_HELM_CHART_VERSION} --hide-notes
+helm upgrade -i retail-store-app-ui oci://public.ecr.aws/aws-containers/retail-store-sample-ui-chart --version ${RETAIL_STORE_APP_HELM_CHART_VERSION} -f ~/environment/values-ui.yaml --hide-notes
+
+kubectl wait --for=condition=Ready nodes --all
+
+
+kubectl port-forward $(kubectl get pods \
+ --selector=app.kubernetes.io/name=ui -o jsonpath='{.items[0].metadata.name}') 8080:8080
+
+
+ Review node pools configuration
+
+ kubectl get nodes -l karpenter.sh/nodepool=general-purpose
+
+ kubectl get nodes -l karpenter.sh/nodepool=system
+
+ for node in $(kubectl get nodes -l karpenter.sh/nodepool=general-purpose -o custom-columns=NAME:.metadata.name --no-headers); do
+  echo "Pods on $node:"
+  kubectl get pods --all-namespaces --field-selector spec.nodeName=$node
+done
+
+kubectl scale --replicas=12 deployment/retail-store-app-ui
+
+
+cat  << EOF >~/environment/values-ui.yaml
+app:
+  theme: default
+  endpoints:
+    catalog: http://retail-store-app-catalog:80
+    carts: http://retail-store-app-carts:80
+    checkout: http://retail-store-app-checkout:80
+    orders: http://retail-store-app-orders:80
+
+topologySpreadConstraints:
+  - maxSkew: 1
+    minDomains: 3
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: DoNotSchedule
+    labelSelector:
+      matchLabels:
+        app.kubernetes.io/name: ui
+EOF
+
+helm upgrade -f ~/environment/values-ui.yaml retail-store-app-ui oci://public.ecr.aws/aws-containers/retail-store-sample-ui-chart --version ${RETAIL_STORE_APP_HELM_CHART_VERSION} --hide-notes
+
+kubectl wait --for=condition=Ready pod -l app.kubernetes.io/instance=retail-store-app-ui --namespace default --timeout=300s
+
+kubectl get node -L topology.kubernetes.io/zone --no-headers | while read node status roles age version zone; do
+echo "Pods on node $node (Zone: $zone):"
+  kubectl get pods --all-namespaces --field-selector spec.nodeName=$node -l app.kubernetes.io/instance=retail-store-app-ui
+echo "-----------------------------------"
+done
+
+kubectl get nodepools general-purpose -o yaml
+
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  annotations:
+    karpenter.sh/nodepool-hash: "4012513481623584108"
+    karpenter.sh/nodepool-hash-version: v3
+  creationTimestamp: "2025-01-15T09:32:29Z"
+  generation: 1
+  labels:
+    app.kubernetes.io/managed-by: eks
+  name: general-purpose
+  resourceVersion: "241001"
+  uid: 9b1c4ad0-d42d-4c63-bd96-b0a201aeec0e
+spec:
+  disruption:
+    budgets:
+    - nodes: 10%
+    consolidateAfter: 30s
+    consolidationPolicy: WhenEmptyOrUnderutilized
+  template:
+    metadata: {}
+    spec:
+      expireAfter: 336h
+      nodeClassRef:
+        group: eks.amazonaws.com
+        kind: NodeClass
+        name: default
+      requirements:
+      - key: karpenter.sh/capacity-type
+        operator: In
+        values:
+        - on-demand
+      - key: eks.amazonaws.com/instance-category
+        operator: In
+        values:
+        - c
+        - m
+        - r
+      - key: eks.amazonaws.com/instance-generation
+        operator: Gt
+        values:
+        - "4"
+      - key: kubernetes.io/arch
+        operator: In
+        values:
+        - amd64
+      - key: kubernetes.io/os
+        operator: In
+        values:
+        - linux
+      terminationGracePeriod: 24h0m0s
